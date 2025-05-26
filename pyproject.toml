@@ -35,7 +35,7 @@ dependencies = [
     "antimeridian",
     "mercantile",
     "odc-geo",
-    "odc-stac"
+    "odc-stac",
 ]
 
 [project.urls]
@@ -86,3 +86,20 @@ unfixable = ["T20", "F841"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.12.0",
+    "dask>=2025.2.0",
+    "datashader>=0.18.1",
+    "distributed>=2025.2.0",
+    "geoviews>=1.14.0",
+    "hvplot>=0.11.3",
+    "ipykernel>=6.29.5",
+    "ipyleaflet>=0.19.2",
+    "planetary-computer>=1.0.0",
+    "python-dotenv>=1.1.0",
+    "requests>=2.32.3",
+    "stac-geoparquet>=0.7.0",
+    "tzdata>=2025.2",
+]
