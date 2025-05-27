@@ -724,19 +724,26 @@ class S2Collection(BaseCollection):
         )
         def filter_baseline(query):
             items = list(query.items())
+
+            # Sort items by processing baseline
+            items = sorted(items, key=lambda i: i.properties.get("s2:processing_baseline", "00.00"), reverse=True)
+
+            # Filter to keep only the latest item for each sensing time and MGRS tile
             latest_items = {}
             for item in items:
                 sensing_time = item.datetime
                 mgrs_tile = item.properties.get("s2:mgrs_tile")
                 key = (sensing_time, mgrs_tile)
-                
-                baseline = item.properties.get("s2:processing_baseline", "0000")
-                if key not in latest_items or baseline > latest_items[key].properties.get("s2:processing_baseline", "0000"):
+                if key not in latest_items:
                     latest_items[key] = item
 
+            # Get unique items
             unique_items = list(latest_items.values())
-            unique_items.sort(key=lambda item: item.datetime)
-            # print(f"Found {len(unique_items):d} items in {collection} collection")
+
+            # Sort unique items by their order in the original items list
+            unique_items.sort(key=lambda item: items.index(item))
+
+            # Return unique items
             return unique_items
 
         self.items  = filter_baseline(search)
