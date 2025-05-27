@@ -722,7 +722,25 @@ class S2Collection(BaseCollection):
         search = self.catalog.search(
             **{k: v for k, v in self.search_params.items() if v is not None}
         )
-        self.items = list(search.items())
+        def filter_baseline(query):
+            items = list(query.items())
+            latest_items = {}
+            for item in items:
+                sensing_time = item.datetime
+                mgrs_tile = item.properties.get("s2:mgrs_tile")
+                key = (sensing_time, mgrs_tile)
+                
+                baseline = item.properties.get("s2:processing_baseline", "0000")
+                if key not in latest_items or baseline > latest_items[key].properties.get("s2:processing_baseline", "0000"):
+                    latest_items[key] = item
+
+            unique_items = list(latest_items.values())
+            unique_items.sort(key=lambda item: item.datetime)
+            # print(f"Found {len(unique_items):d} items in {collection} collection")
+            return unique_items
+
+        self.items  = filter_baseline(search)
+
 
         if not self.items:
             raise ValueError("No items found for the given search parameters.")
@@ -1062,4 +1080,191 @@ class CopernicusDEMCollection(BaseCollection):
         # ds = ds.squeeze(drop=True)
         # if "stac_id" in ds:
         #     ds = ds.drop_vars("stac_id")
+        return ds
+
+class LandsatCollection(BaseCollection):
+    """
+    A class to manage Landsat collections from the Planetary Computer catalog.
+    """
+
+    default_stac_cfg = {
+        "landsat-c2-l2": {
+            "assets": {
+                "*": {"data_type": "float32", "nodata": np.nan}, #TODO:Check if it applies for all the bands in Landsat
+            },
+        },
+        "*": {"warnings": "ignore"},
+    }
+
+    def __init__(
+        self,
+        catalog_url: str = "https://planetarycomputer.microsoft.com/api/stac/v1",
+        collection: str = "landsat-c2-l2",
+        stac_cfg: dict | None = None,
+    ):
+        stac_cfg = stac_cfg or self.default_stac_cfg
+        super().__init__(catalog_url, collection, stac_cfg)
+
+    def search(
+        self: Self,
+        roi: gpd.GeoDataFrame,
+        date_range: str | None = None,
+        query: dict | None = None,
+        item_limit: int = 300,
+        filter_function: Callable[[list], list] | None = None,
+    ) -> Self:
+        """
+        Perform a STAC search using the API, retrieving items sorted by ascending cloud cover
+        instead of filtering by a strict cloud cover threshold.
+
+        Args:
+            roi (gpd.GeoDataFrame): Region of interest.
+            date_range (str, optional): Date range for the search (ISO8601 format).
+            filter_function (Callable, optional): Function to filter the resulting items.
+            use_geoparquet_fallback (bool): Whether to fallback to STAC GeoParquet.
+            item_limit (int, optional): Maximum number of items to retrieve. Default is 300.
+
+        Returns:
+            Updated collection instance with search results.
+        """
+
+        self.roi = roi
+
+        self.search_params = {
+            "collections": self.collection,
+            "intersects": self.roi.to_crs(4326).geometry.item(),
+            "datetime": date_range,
+            "query": query,
+            "sortby": [{"field": "eo:cloud_cover", "direction": "asc"}],
+            "limit": item_limit,
+        }
+
+        # Attempt STAC API search
+        search = self.catalog.search(
+            **{k: v for k, v in self.search_params.items() if v is not None}
+        )
+        self.items = list(search.items())
+
+        if not self.items:
+            raise ValueError("No items found for the given search parameters.")
+
+        # Apply filter function if provided
+        if filter_function:
+            try:
+                self.items = filter_function(self.items)
+                if not self.items:
+                    raise ValueError("Filter function returned no items.")
+            except Exception as e:
+                raise RuntimeError(f"Error in filter_function: {e}") from e
+
+        # Store data extent
+        self.data_extent = self._compute_data_extent(self.items)
+        return self
+
+    @classmethod
+    def _add_metadata_from_stac(
+        cls, items: list[pystac.Item], ds: xr.Dataset
+    ) -> xr.Dataset:
+        """
+        Attach metadata from STAC items to the dataset as coordinates.
+        """
+        if len(items) != ds.sizes["time"]:
+            raise ValueError("Mismatch between STAC items and dataset time dimension.")
+
+        mgrs_tiles = [i.properties["s2:mgrs_tile"] for i in items]
+        cloud_cover = [i.properties["eo:cloud_cover"] for i in items]
+        rel_orbits = [i.properties["sat:relative_orbit"] for i in items]
+        stac_ids = [i.id for i in items]
+
+        ds = ds.assign_coords({"stac_id": ("time", stac_ids)})
+        ds = ds.assign_coords({"s2:mgrs_tile": ("time", mgrs_tiles)})
+        ds = ds.assign_coords({"eo:cloud_cover": ("time", cloud_cover)})
+        ds = ds.assign_coords({"sat:relative_orbit": ("time", rel_orbits)})
+        return ds
+
+    # --- Masking ---
+    def mask_and_scale(
+        self: Self,
+        mask_geometry: odc.geo.geom.Geometry | None = None,
+        mask_nodata: bool = True,
+        mask_values: list[int] | None = None,
+        scale: bool = False,
+        scale_factor: float | None = None,
+        add_offset: float | None = None,
+        scale_vars_to_skip: list[str] | None = None,
+        mask_scl: list[str | SceneClassification | int] | None = None,
+    ) -> Self:
+        """
+        Applies masking and scaling transformations to a Sentinel-2 dataset.
+
+        Masking:
+        - If `mask_geometry` is provided, masks data outside the given geometry.
+        - If `mask_nodata` is True, masks values in `mask_values` (if provided).
+        - If `mask_scl` is provided, masks specific Sentinel-2 Scene Classification Layer (SCL) values.
+
+        Scaling:
+        - If `scale` is True, applies scaling using `scale_factor` and `add_offset`.
+        - Variables listed in `scale_vars_to_skip` are excluded from scaling.
+
+        Args:
+            mask_geometry (odc.geo.geom.Geometry, optional):
+                Geometry to mask the dataset against. If None, no geometric mask is applied.
+            mask_nodata (bool, optional):
+                If True, masks nodata values. Defaults to True.
+            mask_values (list[int], optional):
+                List of values to mask as nodata. Applied if `mask_nodata` is True.
+            scale (bool, optional):
+                If True, applies scaling transformations.
+            scale_factor (float, optional):
+                Factor by which to scale the data. Defaults to None.
+            add_offset (float, optional):
+                Offset to add during scaling. Defaults to None.
+            scale_vars_to_skip (list[str], optional):
+                List of variable names to exclude from scaling. Defaults to None.
+            mask_scl (list[str | SceneClassification | int], optional):
+                List of Sentinel-2 Scene Classification Layer (SCL) class names or numeric values to mask. Defaults to None.
+
+        Returns:
+            S2Collection: The updated instance with masking and scaling applied.
+
+        Valid SCL classes:
+            - NO_DATA
+            - SATURATED_DEFECTIVE
+            - DARK_AREA_PIXELS
+            - CLOUD_SHADOWS
+            - VEGETATION
+            - BARE_SOILS
+            - WATER
+            - CLOUDS_LOW_PROBABILITY
+            - CLOUDS_MEDIUM_PROBABILITY
+            - CLOUDS_HIGH_PROBABILITY
+            - CIRRUS
+            - SNOW_ICE
+        """
+        super().mask_and_scale(
+            mask_geometry=mask_geometry,
+            mask_nodata=mask_nodata,
+            mask_values=mask_values,
+            scale=scale,
+            scale_factor=scale_factor,
+            add_offset=add_offset,
+            scale_vars_to_skip=scale_vars_to_skip,
+        )
+        self.mask_scl = mask_scl
+        return self
+
+    def _apply_masks_and_scale(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Apply masks to the dataset.
+        """
+        ds = super()._apply_masks_and_scale(ds)
+
+        if self.mask_scl:
+            # NOTE/BUG: it is possible that the mask will upgrade the data type to float32 and with
+            # that the nodata value will be changed to np.nan, while the rio attribute will remain the same.
+            # This is for now not an issue, but is noted here because it might eventually happen with a very
+            # specific use case. Then the fix would be to use the keep_rio_attrs decorator with the right args.
+            mask = scl_mask(ds, self.mask_scl)
+            ds = apply_mask(ds, mask)  # type: ignore
+
         return ds
